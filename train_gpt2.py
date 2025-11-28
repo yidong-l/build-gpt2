@@ -22,6 +22,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -53,12 +54,15 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, nh, hs).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, nh, hs).transpose(1, 2) # (B, nh, T, hs)
 
-        att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(hs)) # (B, nh, T, T)
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # type: ignore
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-arrange all head outputs of a single sequence together
+        # att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(hs)) # (B, nh, T, T)
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # type: ignore
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, hs)
 
+        # Use flash-attention built-in function in PyTorch, instead of the above 4 lines.
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-arrange all head outputs of a single sequence together
         # output projection
         y = self.c_proj(y)
         return y
@@ -69,6 +73,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -102,6 +107,26 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight shareing between token embedding and the lm head
+        self.transformer["wte"].weight = self.lm_head.weight
+
+    def _init_weights(self, module):
+        """Initialize weights."""
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** 0.5
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            pass
+            # the following is PyTorch's default
+            # nn.init.ones_(module.weight)
+            # nn.init.zeros_(module.bias)
 
     @classmethod
     def from_pretrained(cls, model_type: str):
@@ -151,7 +176,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}."
 
@@ -168,8 +193,13 @@ class GPT(nn.Module):
         # forward to the final layernorm and classifier
         x = self.transformer['ln_f'](x)
         logits = self.lm_head(x) # (B, T, vocab_size)
+        if targets is None:
+            loss = None
+        else:
+            # reshape logits: (B, T, vocab_size) -> (B*T, vocab_size), targets: (B, T) -> (B*T)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits
+        return logits, loss
 
 def generate(model, x, max_length):
     """
@@ -220,9 +250,21 @@ def sample(model, num_samples, max_length):
 
 
 if __name__ == "__main__":
-    model = GPT.from_pretrained('gpt2')
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    print(torch.version.cuda)
+    print(f"TF32 matmul enabled: {matmul_tf32}")
+
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+
+    # Load a pretrained GPT-2 model
+    # model = GPT.from_pretrained('gpt2')
+    model = GPT(GPTConfig())  # initialize a fresh model
     model.eval()
     model.to('cuda' if torch.cuda.is_available() else 'cpu')
 
-    print("Model loaded successfully. Did not crash yay!") 
-    sample(model, num_samples=5, max_length=30)
+    print("Model loaded successfully. Did not crash yay!")
+    # sample(model, num_samples=5, max_length=30)
+    print(model.state_dict()["lm_head.weight"].shape)
+    print(model.state_dict()["transformer.wte.weight"].shape)
