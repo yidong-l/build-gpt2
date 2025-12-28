@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
+import tiktoken
 
 @dataclass
 class GPTConfig:
@@ -108,15 +110,18 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # weight shareing between token embedding and the lm head
+        # weight sharing between token embedding and the lm head
         self.transformer["wte"].weight = self.lm_head.weight
+
+        # initialize weights
+        self.apply(self._init_weights)
 
     def _init_weights(self, module):
         """Initialize weights."""
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std *= (2 * self.config.n_layer) ** 0.5
+                std *= (2 * self.config.n_layer) ** -0.5
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -201,6 +206,36 @@ class GPT(nn.Module):
 
         return logits, loss
 
+class DatasetLite(Dataset):
+    def __init__(self, T, fpath="./input.txt"):
+        self.T = T
+        self.tokens = []
+        self.len = 0
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        self.tokens = enc.encode(text)
+        self.len = len(self.tokens) // T
+        print(f"Loaded {len(self.tokens)} tokens from {fpath}")
+
+        # Each batch slice (B*T+1) tokens, so pad one extra token at the end.
+        self.tokens.extend(enc.encode("\n"))
+
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, idx):
+        block = self.T
+        start = idx * block
+        end = start + block + 1
+        buf = torch.tensor(self.tokens[start:end])
+        x = buf[:-1]
+        y = buf[1:]
+        return x, y
+
+
 def generate(model, x, max_length):
     """
     Generate tokens from the model given a starting sequence x.
@@ -213,7 +248,7 @@ def generate(model, x, max_length):
     """
     while x.size(1) < max_length:
         with torch.no_grad():
-            logits = model(x) # (B, T, vocab_size)
+            logits, _ = model(x) # (B, T, vocab_size)
         
         # take the logits at the last time step
         logits = logits[:, -1, :] # (B, vocab_size)
@@ -248,23 +283,51 @@ def sample(model, num_samples, max_length):
         print(">", decoded)
 
 
+def data_batch(B=4, T=32):
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    with open("input.txt", "r", encoding="utf-8") as f:
+        text = f.read()
+    tokens = enc.encode(text)
+    buf = torch.tensor(tokens[:B*T+1])
+    x = buf[:-1].view(B, T)
+    y = buf[1:].view(B, T)
+    return x, y
+
+def train_loop(dataloader, model, optimizer, device):
+    for i, (x, y) in enumerate(dataloader):
+        if i >= 50:
+            break
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f"Step {i}, Loss: {loss.item()}")
+
 
 if __name__ == "__main__":
-    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
-    print(torch.version.cuda)
-    print(f"TF32 matmul enabled: {matmul_tf32}")
-
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+
     # Load a pretrained GPT-2 model
     # model = GPT.from_pretrained('gpt2')
-    model = GPT(GPTConfig())  # initialize a fresh model
-    model.eval()
-    model.to('cuda' if torch.cuda.is_available() else 'cpu')
+    model = GPT(GPTConfig(vocab_size=50304))  # initialize a fresh model
+    model.to(device)
 
     print("Model loaded successfully. Did not crash yay!")
+    B, T = 4, 32
+    dataset = DatasetLite(T=T)
+    dataloder = DataLoader(dataset, batch_size=B, shuffle=False)
+    print(f"1 epoch = {len(dataset) // B} batches")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    train_loop(dataloder, model, optimizer, device)
+
+
     # sample(model, num_samples=5, max_length=30)
-    print(model.state_dict()["lm_head.weight"].shape)
-    print(model.state_dict()["transformer.wte.weight"].shape)
