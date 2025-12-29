@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -296,16 +297,21 @@ def data_batch(B=4, T=32):
 
 def train_loop(dataloader, model, optimizer, device):
     for i, (x, y) in enumerate(dataloader):
-        if i >= 50:
+        if i >= 10:
             break
+        t0 = time.time()
         x = x.to(device)
         y = y.to(device)
-
         optimizer.zero_grad()
         logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        print(f"Step {i}, Loss: {loss.item()}")
+        torch.cuda.synchronize()
+        t1 = time.time()
+
+        dt = (t1 - t0) * 1000  # milliseconds
+
+        print(f"Step {i}, Loss: {loss.item()}, dt: {dt:.2f} ms")
 
 
 if __name__ == "__main__":
@@ -322,7 +328,7 @@ if __name__ == "__main__":
     model.to(device)
 
     print("Model loaded successfully. Did not crash yay!")
-    B, T = 4, 32
+    B, T = 2, 1024
     dataset = DatasetLite(T=T)
     dataloder = DataLoader(dataset, batch_size=B, shuffle=False)
     print(f"1 epoch = {len(dataset) // B} batches")
