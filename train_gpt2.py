@@ -1,10 +1,12 @@
 from dataclasses import dataclass
 import math
+import inspect
 import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 import tiktoken
 
 @dataclass
@@ -62,6 +64,8 @@ class CausalSelfAttention(nn.Module):
         # att = F.softmax(att, dim=-1)
         # y = att @ v # (B, nh, T, hs)
 
+        # Make Training Faster #4
+        # - Use Flash Attention
         # Use flash-attention built-in function in PyTorch, instead of the above 4 lines.
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
@@ -182,6 +186,39 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        """
+        Returns an AdamW optimizer with weight decay applied to the subset of
+        model parameters (and enabled fused optimizer).
+        """
+        # named_paramters() returns an iterator of tuple: name (String), parameter (nn.Parameter)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+
+        # 2D tensors enable weight decay: matmul W weights and embeddings.
+        # 1D tensors disable weight decay: bias, layernorms.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        # Create optimizer groups
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        # Check if fused AdamW is available in this PyTorch version.
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {fused}")
+
+        # Create AdamW optimizer
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused)
+        return optimizer
+
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}."
@@ -295,23 +332,55 @@ def data_batch(B=4, T=32):
     y = buf[1:].view(B, T)
     return x, y
 
-def train_loop(dataloader, model, optimizer, device):
+def train_loop(dataloader, model, optimizer, lr_scheduler, device):
     for i, (x, y) in enumerate(dataloader):
-        if i >= 10:
+        if i >= 15:
             break
         t0 = time.time()
         x = x.to(device)
         y = y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+
+        # Make Training Faster #2
+        # - Enable PyTorch Automatic Mixed Precision
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
+        # Gradient clipping: ensure norm of global gradient ||g|| vector is less than c=1.0
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        lr_scheduler.step()
         torch.cuda.synchronize()
         t1 = time.time()
 
         dt = (t1 - t0) * 1000  # milliseconds
+        tokens_per_sec = (x.numel()) / (t1 - t0)
+        lr = lr_scheduler.get_last_lr()[0]
+        print(f"Step {i}, Loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
 
-        print(f"Step {i}, Loss: {loss.item()}, dt: {dt:.2f} ms")
+
+
+def learning_rate_scheduler(optimizer, max_lr, min_lr, warmup_steps, max_steps):
+    """Returns a learning rate scheduler with a linear warmup followed by a cosine decay.
+    """
+    # 1. Ensure the optimizer's base_lr matches max_lr
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = max_lr
+
+    # 2. Linear Warmup: starts at 1/100th of max_lr and reaches max_lr
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+
+    # 3. Cosine Decay: lasts for the remaining steps
+    decay_steps = max_steps - warmup_steps
+    decay_scheduler = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=min_lr)
+
+    # 4. Combine into SequentialLR
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, decay_scheduler],
+        milestones=[warmup_steps]
+    )
+    return scheduler
 
 
 if __name__ == "__main__":
@@ -324,16 +393,27 @@ if __name__ == "__main__":
 
     # Load a pretrained GPT-2 model
     # model = GPT.from_pretrained('gpt2')
-    model = GPT(GPTConfig(vocab_size=50304))  # initialize a fresh model
-    model.to(device)
 
-    print("Model loaded successfully. Did not crash yay!")
-    B, T = 2, 1024
+    # Initialize a fresh model
+    model = GPT(GPTConfig(vocab_size=50304))
+    model.to(device)
+    # Make Training Faster #3
+    # - Use torch.compile(), i.e. kernel fusion.
+    model = torch.compile(model)
+    B, T = 16, 1024
     dataset = DatasetLite(T=T)
     dataloder = DataLoader(dataset, batch_size=B, shuffle=False)
     print(f"1 epoch = {len(dataset) // B} batches")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    train_loop(dataloder, model, optimizer, device)
+
+    max_lr = 6e-4
+    min_lr = 0.1 * max_lr
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+    lr_scheduler = learning_rate_scheduler(optimizer, max_lr=max_lr, min_lr=min_lr, warmup_steps=10, max_steps=50)
+
+    # Make Training Faster #1
+    # - Make Nvidia GPU to use TF32.
+    torch.set_float32_matmul_precision('high')
+    train_loop(dataloder, model, optimizer, lr_scheduler, device)
 
 
     # sample(model, num_samples=5, max_length=30)
