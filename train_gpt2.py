@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import itertools
 import inspect
 import time
 import torch
@@ -332,20 +333,26 @@ def data_batch(B=4, T=32):
     y = buf[1:].view(B, T)
     return x, y
 
-def train_loop(dataloader, model, optimizer, lr_scheduler, device):
+def train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, device):
     for i, (x, y) in enumerate(dataloader):
-        if i >= 15:
+        if i >= 30:
             break
         t0 = time.time()
-        x = x.to(device)
-        y = y.to(device)
         optimizer.zero_grad()
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x = x.to(device)
+            y = y.to(device)
+            # Make Training Faster #2
+            # - Enable PyTorch Automatic Mixed Precision
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+                # scale down the loss to account for gradient accumulation
+                # loss = ∑(l1, l2, ...) / (B * grad_accum_steps)
+                loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
 
-        # Make Training Faster #2
-        # - Enable PyTorch Automatic Mixed Precision
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss.backward()
         # Gradient clipping: ensure norm of global gradient ||g|| vector is less than c=1.0
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -353,10 +360,11 @@ def train_loop(dataloader, model, optimizer, lr_scheduler, device):
         torch.cuda.synchronize()
         t1 = time.time()
 
-        dt = (t1 - t0) * 1000  # milliseconds
-        tokens_per_sec = (x.numel()) / (t1 - t0)
+        dt = t1 - t0
+        tokens_processed = x.numel() * grad_accum_steps
+        tokens_per_sec = tokens_processed / dt
         lr = lr_scheduler.get_last_lr()[0]
-        print(f"Step {i}, Loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
+        print(f"Step {i}, Loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
 
 
 
@@ -388,6 +396,16 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
+    total_batch_size = 524288 # 2**19, 0.5M tokens
+    B, T = 16, 1024
+    assert total_batch_size % (B * T) == 0, "total_batch_size must be divisible by B * T"
+    grad_accum_steps = total_batch_size // (B*T)
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> gradient accumulation steps: {grad_accum_steps}")
+
+    max_lr = 6e-4
+    min_lr = 0.1 * max_lr
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
@@ -400,20 +418,16 @@ if __name__ == "__main__":
     # Make Training Faster #3
     # - Use torch.compile(), i.e. kernel fusion.
     model = torch.compile(model)
-    B, T = 16, 1024
     dataset = DatasetLite(T=T)
-    dataloder = DataLoader(dataset, batch_size=B, shuffle=False)
+    dataloder = DataLoader(dataset, batch_size=B, shuffle=False, drop_last=True)
+    dataloader = itertools.cycle(dataloder)  # TODO: Use a different dataset.
     print(f"1 epoch = {len(dataset) // B} batches")
 
-    max_lr = 6e-4
-    min_lr = 0.1 * max_lr
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
     lr_scheduler = learning_rate_scheduler(optimizer, max_lr=max_lr, min_lr=min_lr, warmup_steps=10, max_steps=50)
 
     # Make Training Faster #1
     # - Make Nvidia GPU to use TF32.
     torch.set_float32_matmul_precision('high')
-    train_loop(dataloder, model, optimizer, lr_scheduler, device)
-
-
+    train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, device)
     # sample(model, num_samples=5, max_length=30)
