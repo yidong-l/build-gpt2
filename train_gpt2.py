@@ -2,13 +2,19 @@ from dataclasses import dataclass
 import math
 import itertools
 import inspect
+import os
 import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import tiktoken
+import warnings
 
 @dataclass
 class GPTConfig:
@@ -17,6 +23,27 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12  # number of attention heads
     n_embd: int = 768 # embedding/hidden dimension
+
+@dataclass
+class DDPConfig:
+    enabled: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+    master_process: bool = True
+
+    @classmethod
+    def from_env(cls):
+        rank = int(os.environ.get("RANK", -1))
+        if rank != -1:
+            return cls(
+                enabled=True,
+                rank=rank,
+                local_rank=int(os.environ.get("LOCAL_RANK", 0)),
+                world_size=int(os.environ.get("WORLD_SIZE", 1)),
+                master_process=(rank == 0)
+            )
+        return cls()
 
 class CausalSelfAttention(nn.Module):
 
@@ -208,13 +235,16 @@ class GPT(nn.Module):
 
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        if ddp_cfg.master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
         # Check if fused AdamW is available in this PyTorch version.
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         fused = fused_available and 'cuda' in device
-        print(f"using fused AdamW: {fused}")
+
+        if ddp_cfg.master_process:
+            print(f"using fused AdamW: {fused}")
 
         # Create AdamW optimizer
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused)
@@ -256,7 +286,6 @@ class DatasetLite(Dataset):
         enc = tiktoken.get_encoding("gpt2")
         self.tokens = enc.encode(text)
         self.len = len(self.tokens) // T
-        print(f"Loaded {len(self.tokens)} tokens from {fpath}")
 
         # Each batch slice (B*T+1) tokens, so pad one extra token at the end.
         self.tokens.extend(enc.encode("\n"))
@@ -351,8 +380,14 @@ def train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, dev
                 # loss = ∑(l1, l2, ...) / (B * grad_accum_steps)
                 loss = loss / grad_accum_steps
             loss_accum += loss.detach()
+            if ddp_cfg.enabled:
+                # Skip synchronization for intermediate grad accum micro-steps.
+                # A small hack to replace DDP.no_sync() context manager.
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
 
+        if ddp_cfg.enabled:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         # Gradient clipping: ensure norm of global gradient ||g|| vector is less than c=1.0
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -361,10 +396,11 @@ def train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, dev
         t1 = time.time()
 
         dt = t1 - t0
-        tokens_processed = x.numel() * grad_accum_steps
+        tokens_processed = x.numel() * grad_accum_steps * ddp_cfg.world_size
         tokens_per_sec = tokens_processed / dt
         lr = lr_scheduler.get_last_lr()[0]
-        print(f"Step {i}, Loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
+        if ddp_cfg.master_process:
+            print(f"Step {i}, Loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
 
 
 
@@ -390,27 +426,46 @@ def learning_rate_scheduler(optimizer, max_lr, min_lr, warmup_steps, max_steps):
     )
     return scheduler
 
+# DDP launch command:
+# Single node, 8 GPUs:
+#   torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+ddp_cfg = DDPConfig().from_env()
 
 if __name__ == "__main__":
+    warnings.filterwarnings("ignore", category=UserWarning)
+
+    # Set up distributed data parallel (DDP).
+    # torchrun command sets environment variables: RANK, LOCAL_RANK, WORLD_SIZE
+    if ddp_cfg.enabled:
+        assert torch.cuda.is_available(), "DDP mode requires CUDA."
+        init_process_group(backend="nccl")
+        device = f"cuda:{ddp_cfg.local_rank}"
+        torch.cuda.set_device(device)
+    else:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+
+
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524288 # 2**19, 0.5M tokens
     B, T = 16, 1024
-    assert total_batch_size % (B * T) == 0, "total_batch_size must be divisible by B * T"
-    grad_accum_steps = total_batch_size // (B*T)
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> gradient accumulation steps: {grad_accum_steps}")
+    assert total_batch_size % (B * T * ddp_cfg.world_size) == 0, "total_batch_size must be divisible by B * T * ddp_world_size"
+    grad_accum_steps = total_batch_size // (B * T * ddp_cfg.world_size)
+    if ddp_cfg.master_process:
+        print(f"total desired batch size: {total_batch_size}")
+        print(f"=> gradient accumulation steps: {grad_accum_steps}")
 
-    max_lr = 6e-4
-    min_lr = 0.1 * max_lr
+    dataset = DatasetLite(T=T)
+    sampler = DistributedSampler(dataset, shuffle=True, drop_last=True) if ddp_cfg.enabled else None
+    dataloder = DataLoader(dataset, batch_size=B, shuffle=False, sampler=sampler, drop_last=True)
+    dataloader = itertools.cycle(dataloder)  # TODO: Use a different dataset.
+    if ddp_cfg.master_process:
+        print(f"1 epoch = {len(dataset) // B} batches")
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-
-    # Load a pretrained GPT-2 model
-    # model = GPT.from_pretrained('gpt2')
 
     # Initialize a fresh model
     model = GPT(GPTConfig(vocab_size=50304))
@@ -418,16 +473,19 @@ if __name__ == "__main__":
     # Make Training Faster #3
     # - Use torch.compile(), i.e. kernel fusion.
     model = torch.compile(model)
-    dataset = DatasetLite(T=T)
-    dataloder = DataLoader(dataset, batch_size=B, shuffle=False, drop_last=True)
-    dataloader = itertools.cycle(dataloder)  # TODO: Use a different dataset.
-    print(f"1 epoch = {len(dataset) // B} batches")
+    if ddp_cfg.enabled:
+        model = DDP(model, device_ids=[ddp_cfg.local_rank])
+    raw_model = model.module if ddp_cfg.enabled else model  # keep "raw" unwrapped model.
 
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+    max_lr = 6e-4
+    min_lr = 0.1 * max_lr
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
     lr_scheduler = learning_rate_scheduler(optimizer, max_lr=max_lr, min_lr=min_lr, warmup_steps=10, max_steps=50)
 
     # Make Training Faster #1
     # - Make Nvidia GPU to use TF32.
     torch.set_float32_matmul_precision('high')
     train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, device)
-    # sample(model, num_samples=5, max_length=30)
+
+    if ddp_cfg.enabled:
+        destroy_process_group()
