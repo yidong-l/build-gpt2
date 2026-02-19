@@ -4,6 +4,7 @@ import itertools
 import inspect
 import os
 import time
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -13,8 +14,8 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-import tiktoken
 import warnings
+import dataset_lite
 
 @dataclass
 class GPTConfig:
@@ -304,7 +305,7 @@ class DatasetLite(Dataset):
         return x, y
 
 
-def generate(model, x, max_length):
+def generate(model, x, max_length, rng):
     """
     Generate tokens from the model given a starting sequence x.
     Args:
@@ -322,37 +323,34 @@ def generate(model, x, max_length):
         logits = logits[:, -1, :] # (B, vocab_size)
         # get probabilities from softmax
         probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-        topk_probs, topk_indices  = torch.topk(probs, 50, dim=-1) # (B, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50)
         # select a token from the top-k probabilities (aka. sample from the distribution)
-        ix = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
+        ix = torch.multinomial(topk_probs, num_samples=1, generator=rng) # (B, 1)
         # gather the corresponding token indices 
         xcol = torch.gather(topk_indices, 1, ix) # (B, 1)
         # append to the sequence
         x = torch.cat((x, xcol), dim=1) # append to the sequence 
     return x
 
-def sample(model, num_samples, max_length):
-    """Sample generated sequences from the model and print them."""
-    import tiktoken
+def sample(device, model, prompt, num_samples, max_length, rng):
+    """Sample generated sequences from the model."""
     enc = tiktoken.get_encoding("gpt2")
     tokens = enc.encode("Hello, I'm a language model,")
     tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
     tokens = tokens.unsqueeze(0).repeat(num_samples, 1) # (1, 8)
-    x = tokens.to('cuda')
+    x = tokens.to(device)
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    x = generate(model, x, max_length, rng) # (B, max_length)
 
-    x = generate(model, x, max_length=max_length) # (B, max_length)
-
+    samples = []
     for i in range(num_samples):
         tokens = x[i, :max_length].tolist()
         decoded = enc.decode(tokens)
-        print(">", decoded)
+        samples.append(decoded)
+    return samples
 
 
 def data_batch(B=4, T=32):
-    import tiktoken
     enc = tiktoken.get_encoding("gpt2")
     with open("input.txt", "r", encoding="utf-8") as f:
         text = f.read()
@@ -362,11 +360,45 @@ def data_batch(B=4, T=32):
     y = buf[1:].view(B, T)
     return x, y
 
-def train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, device):
-    for i, (x, y) in enumerate(dataloader):
-        if i >= 30:
+def train_loop(train_loader, val_loader, model, optimizer, lr_scheduler, grad_accum_steps, device):
+    for step, (x, y) in enumerate(train_loader):
+        if step >= 300:  # TODO: remove to train full dataset
             break
+
         t0 = time.time()
+
+        # once in a while evaludate validation loss.
+        if step % 100 == 0:
+            model.eval()
+            with torch.no_grad():
+                val_loss_avg = 0.0
+                val_loss_steps = 20
+                val_loader_it = iter(val_loader)
+                for _ in range(val_loss_steps):
+                    x, y = next(val_loader_it)
+                    x, y = x.to(device), y.to(device)
+                    # Automatic Mixed Precision
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_avg += loss.detach()
+
+            if ddp_cfg.enabled:
+                dist.all_reduce(val_loss_avg, op=dist.ReduceOp.AVG)
+            if ddp_cfg.master_process:
+                print(f"validation loss: {val_loss_avg.item():.4f}")
+
+        # once in a while generate from the model
+        if step > 0 and step % 100 == 0:
+            model.eval()
+            sample_rng = torch.Generator(device=device)
+            sample_rng.manual_seed(42 + ddp_cfg.rank)
+            samples = sample(device, model, prompt="Hello, I'm a language model,", num_samples=4, max_length=32, rng=sample_rng)
+            for i, decoded in enumerate(samples):
+                print(f"rank {ddp_cfg.rank} sample {i}: {decoded}")
+
+
+        model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
@@ -400,7 +432,7 @@ def train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, dev
         tokens_per_sec = tokens_processed / dt
         lr = lr_scheduler.get_last_lr()[0]
         if ddp_cfg.master_process:
-            print(f"Step {i}, Loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
+            print(f"Step {step}, Loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
 
 
 
@@ -452,19 +484,22 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524288 # 2**19, 0.5M tokens
-    B, T = 16, 1024
+    B, T = 32, 1024
     assert total_batch_size % (B * T * ddp_cfg.world_size) == 0, "total_batch_size must be divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_cfg.world_size)
     if ddp_cfg.master_process:
         print(f"total desired batch size: {total_batch_size}")
         print(f"=> gradient accumulation steps: {grad_accum_steps}")
 
-    dataset = DatasetLite(T=T)
-    sampler = DistributedSampler(dataset, shuffle=True, drop_last=True) if ddp_cfg.enabled else None
-    dataloder = DataLoader(dataset, batch_size=B, shuffle=False, sampler=sampler, drop_last=True)
-    dataloader = itertools.cycle(dataloder)  # TODO: Use a different dataset.
+
+    DATA_DIR = '/home/ubuntu/local_data/edu_fineweb10B/'
+    train_dataset = dataset_lite.FineWebDataset(split='train', T=T, data_dir=DATA_DIR)
+    val_dataset = dataset_lite.FineWebDataset(split='val', T=T, data_dir=DATA_DIR)
+    sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=True) if ddp_cfg.enabled else None
+    train_loader = DataLoader(train_dataset, batch_size=B, shuffle=False, sampler=sampler, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=B, shuffle=False, drop_last=True)
     if ddp_cfg.master_process:
-        print(f"1 epoch = {len(dataset) // B} batches")
+        print(f"1 epoch = {len(train_dataset) // B} batches")
 
 
     # Initialize a fresh model
@@ -479,13 +514,15 @@ if __name__ == "__main__":
 
     max_lr = 6e-4
     min_lr = 0.1 * max_lr
+    warmup_steps = 715  # 375M tokens / 0.5M batch_size
+    max_steps = 19073  # 10B tokens / 0.5M batch_size
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
-    lr_scheduler = learning_rate_scheduler(optimizer, max_lr=max_lr, min_lr=min_lr, warmup_steps=10, max_steps=50)
+    lr_scheduler = learning_rate_scheduler(optimizer, max_lr=max_lr, min_lr=min_lr, warmup_steps=warmup_steps, max_steps=max_steps)
 
     # Make Training Faster #1
     # - Make Nvidia GPU to use TF32.
     torch.set_float32_matmul_precision('high')
-    train_loop(dataloader, model, optimizer, lr_scheduler, grad_accum_steps, device)
+    train_loop(train_loader, val_loader, model, optimizer, lr_scheduler, grad_accum_steps, device)
 
     if ddp_cfg.enabled:
         destroy_process_group()
