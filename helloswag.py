@@ -1,6 +1,7 @@
 """
 Downloads and evaluates HellaSwag in Python.
 https://github.com/rowanz/hellaswag
+The download location is set by `DATA_CACHE_DIR`.
 
 Example HellaSwag json item:
 

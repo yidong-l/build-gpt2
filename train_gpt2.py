@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import warnings
 import dataset_lite
+import helloswag
 
 @dataclass
 class GPTConfig:
@@ -236,7 +237,7 @@ class GPT(nn.Module):
 
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        if ddp_cfg.master_process:
+        if DDP_CFG.master_process:
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
@@ -244,7 +245,7 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         fused = fused_available and 'cuda' in device
 
-        if ddp_cfg.master_process:
+        if DDP_CFG.master_process:
             print(f"using fused AdamW: {fused}")
 
         # Create AdamW optimizer
@@ -360,22 +361,56 @@ def data_batch(B=4, T=32):
     y = buf[1:].view(B, T)
     return x, y
 
-def train_loop(train_loader, val_loader, model, optimizer, lr_scheduler, grad_accum_steps, device):
-    for step, (x, y) in enumerate(train_loader):
-        if step >= 300:  # TODO: remove to train full dataset
-            break
+def helloswag_predict(tokens, mask, logits):
+    """
+    Helper function to predict the label for a HellaSwag example given the model's output logits.
+    """
 
+    # align positions of tokens and predicted logits
+    shift_logits = (logits[..., :-1, :]).contiguous()   # (4, T-1, n_vocab)
+    shift_tokens = (tokens[..., 1:]).contiguous()       # (4, T-1)
+    # evaluate the autoregressive loss at all positions
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')   # (4*(T-1))
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask  # (4, T- 1)
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    predicted = avg_loss.argmin().item()
+
+    return predicted
+
+def infinite_dataloader(loader):
+    """A helper function to create an infinite dataloader iter from a finite one."""
+    while True:
+        for batch in loader:
+            yield batch
+
+def train_loop(model, device, train_loader, val_loader, optimizer, lr_scheduler, grad_accum_steps, max_steps):
+    EVAL_INTERVAL = 250
+
+    log_file = os.path.join(LOG_DIR, f"log.txt")
+    with open(log_file, "w") as f:  # mode 'w' to clear the file.
+        pass
+
+    train_loader = infinite_dataloader(train_loader)
+    for step in range(max_steps):
+        x, y = next(train_loader)
         t0 = time.time()
 
         # once in a while evaludate validation loss.
-        if step % 100 == 0:
+        if step % EVAL_INTERVAL == 0 or step == max_steps - 1:
             model.eval()
             with torch.no_grad():
                 val_loss_avg = 0.0
                 val_loss_steps = 20
-                val_loader_it = iter(val_loader)
-                for _ in range(val_loss_steps):
-                    x, y = next(val_loader_it)
+                for x, y in itertools.islice(val_loader, val_loss_steps):
                     x, y = x.to(device), y.to(device)
                     # Automatic Mixed Precision
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -383,19 +418,54 @@ def train_loop(train_loader, val_loader, model, optimizer, lr_scheduler, grad_ac
                     loss = loss / val_loss_steps
                     val_loss_avg += loss.detach()
 
-            if ddp_cfg.enabled:
+            if DDP_CFG.enabled:
                 dist.all_reduce(val_loss_avg, op=dist.ReduceOp.AVG)
-            if ddp_cfg.master_process:
+            if DDP_CFG.master_process:
                 print(f"validation loss: {val_loss_avg.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_avg.item():.4f}\n")
+
+        # once in a while evaludate HellaSwag.
+        if step % EVAL_INTERVAL == 0 or step == max_steps - 1:
+            num_correct = 0
+            num_total = 0
+            for i, example in enumerate(helloswag.iterate_examples("val")):
+                if i % DDP_CFG.world_size != DDP_CFG.rank:
+                    continue  # partition the evaluation data across ranks
+
+                tokens, mask, label = helloswag.render_example(example)
+                tokens, mask = tokens.to(device), mask.to(device)
+                with torch.no_grad():
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, _ = model(tokens)
+                    predicted = helloswag_predict(tokens, mask, logits)
+                num_total += 1
+                num_correct += int(predicted == label)
+
+            if DDP_CFG.enabled:
+                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                num_correct = torch.tensor(num_correct, dtype=torch.long, device=device)
+                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_correct, op=dist.ReduceOp.SUM)
+
+                num_total = num_total.item()
+                num_correct = num_correct.item()
+
+            # normalized likelihood: predictions use avg loss per token instead of total loss.
+            acc_norm = num_correct / num_total
+            if DDP_CFG.master_process:
+                print(f"HellaSwag accuracy: {num_correct}/{num_total}={acc_norm:.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} hella {acc_norm:.4f}\n")
 
         # once in a while generate from the model
-        if step > 0 and step % 100 == 0:
+        if (step % EVAL_INTERVAL == 0 and step > 0) or step == max_steps - 1:
             model.eval()
             sample_rng = torch.Generator(device=device)
-            sample_rng.manual_seed(42 + ddp_cfg.rank)
+            sample_rng.manual_seed(42 + DDP_CFG.rank)
             samples = sample(device, model, prompt="Hello, I'm a language model,", num_samples=4, max_length=32, rng=sample_rng)
             for i, decoded in enumerate(samples):
-                print(f"rank {ddp_cfg.rank} sample {i}: {decoded}")
+                print(f"rank {DDP_CFG.rank} sample {i}: {decoded}")
 
 
         model.train()
@@ -412,13 +482,13 @@ def train_loop(train_loader, val_loader, model, optimizer, lr_scheduler, grad_ac
                 # loss = ∑(l1, l2, ...) / (B * grad_accum_steps)
                 loss = loss / grad_accum_steps
             loss_accum += loss.detach()
-            if ddp_cfg.enabled:
+            if DDP_CFG.enabled:
                 # Skip synchronization for intermediate grad accum micro-steps.
                 # A small hack to replace DDP.no_sync() context manager.
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
 
-        if ddp_cfg.enabled:
+        if DDP_CFG.enabled:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         # Gradient clipping: ensure norm of global gradient ||g|| vector is less than c=1.0
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -428,11 +498,13 @@ def train_loop(train_loader, val_loader, model, optimizer, lr_scheduler, grad_ac
         t1 = time.time()
 
         dt = t1 - t0
-        tokens_processed = x.numel() * grad_accum_steps * ddp_cfg.world_size
+        tokens_processed = x.numel() * grad_accum_steps * DDP_CFG.world_size
         tokens_per_sec = tokens_processed / dt
         lr = lr_scheduler.get_last_lr()[0]
-        if ddp_cfg.master_process:
+        if DDP_CFG.master_process:
             print(f"Step {step}, Loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 
 
@@ -444,7 +516,7 @@ def learning_rate_scheduler(optimizer, max_lr, min_lr, warmup_steps, max_steps):
         param_group['lr'] = max_lr
 
     # 2. Linear Warmup: starts at 1/100th of max_lr and reaches max_lr
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.001, end_factor=1.0, total_iters=warmup_steps)
 
     # 3. Cosine Decay: lasts for the remaining steps
     decay_steps = max_steps - warmup_steps
@@ -462,17 +534,19 @@ def learning_rate_scheduler(optimizer, max_lr, min_lr, warmup_steps, max_steps):
 # Single node, 8 GPUs:
 #   torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
-ddp_cfg = DDPConfig().from_env()
+LOG_DIR = "log"
+DATA_DIR = '/home/ubuntu/local_data/edu_fineweb10B/'
+DDP_CFG = DDPConfig().from_env()
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
 
     # Set up distributed data parallel (DDP).
     # torchrun command sets environment variables: RANK, LOCAL_RANK, WORLD_SIZE
-    if ddp_cfg.enabled:
+    if DDP_CFG.enabled:
         assert torch.cuda.is_available(), "DDP mode requires CUDA."
         init_process_group(backend="nccl")
-        device = f"cuda:{ddp_cfg.local_rank}"
+        device = f"cuda:{DDP_CFG.local_rank}"
         torch.cuda.set_device(device)
     else:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -485,20 +559,20 @@ if __name__ == "__main__":
 
     total_batch_size = 524288 # 2**19, 0.5M tokens
     B, T = 32, 1024
-    assert total_batch_size % (B * T * ddp_cfg.world_size) == 0, "total_batch_size must be divisible by B * T * ddp_world_size"
-    grad_accum_steps = total_batch_size // (B * T * ddp_cfg.world_size)
-    if ddp_cfg.master_process:
+    assert total_batch_size % (B * T * DDP_CFG.world_size) == 0, "total_batch_size must be divisible by B * T * ddp_world_size"
+    grad_accum_steps = total_batch_size // (B * T * DDP_CFG.world_size)
+    if DDP_CFG.master_process:
         print(f"total desired batch size: {total_batch_size}")
         print(f"=> gradient accumulation steps: {grad_accum_steps}")
 
 
-    DATA_DIR = '/home/ubuntu/local_data/edu_fineweb10B/'
     train_dataset = dataset_lite.FineWebDataset(split='train', T=T, data_dir=DATA_DIR)
     val_dataset = dataset_lite.FineWebDataset(split='val', T=T, data_dir=DATA_DIR)
-    sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=True) if ddp_cfg.enabled else None
+    sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=True) if DDP_CFG.enabled else None
     train_loader = DataLoader(train_dataset, batch_size=B, shuffle=False, sampler=sampler, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=B, shuffle=False, drop_last=True)
-    if ddp_cfg.master_process:
+
+    if DDP_CFG.master_process:
         print(f"1 epoch = {len(train_dataset) // B} batches")
 
 
@@ -508,9 +582,9 @@ if __name__ == "__main__":
     # Make Training Faster #3
     # - Use torch.compile(), i.e. kernel fusion.
     model = torch.compile(model)
-    if ddp_cfg.enabled:
-        model = DDP(model, device_ids=[ddp_cfg.local_rank])
-    raw_model = model.module if ddp_cfg.enabled else model  # keep "raw" unwrapped model.
+    if DDP_CFG.enabled:
+        model = DDP(model, device_ids=[DDP_CFG.local_rank])
+    raw_model = model.module if DDP_CFG.enabled else model  # keep "raw" unwrapped model.
 
     max_lr = 6e-4
     min_lr = 0.1 * max_lr
@@ -522,7 +596,11 @@ if __name__ == "__main__":
     # Make Training Faster #1
     # - Make Nvidia GPU to use TF32.
     torch.set_float32_matmul_precision('high')
-    train_loop(train_loader, val_loader, model, optimizer, lr_scheduler, grad_accum_steps, device)
 
-    if ddp_cfg.enabled:
+    # create the log directory where we will write checkpoints and logs.
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    train_loop(model, device, train_loader, val_loader, optimizer, lr_scheduler, grad_accum_steps, max_steps)
+
+    if DDP_CFG.enabled:
         destroy_process_group()
