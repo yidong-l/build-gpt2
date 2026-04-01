@@ -401,7 +401,6 @@ def train_loop(model, device, train_loader, val_loader, optimizer, lr_scheduler,
 
     train_loader = infinite_dataloader(train_loader)
     for step in range(max_steps):
-        x, y = next(train_loader)
         t0 = time.time()
 
         # once in a while evaludate validation loss.
@@ -472,6 +471,7 @@ def train_loop(model, device, train_loader, val_loader, optimizer, lr_scheduler,
         optimizer.zero_grad()
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
+            x, y = next(train_loader)
             x = x.to(device)
             y = y.to(device)
             # Make Training Faster #2
