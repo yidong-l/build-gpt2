@@ -424,6 +424,19 @@ def train_loop(model, device, train_loader, val_loader, optimizer, lr_scheduler,
                 with open(log_file, "a") as f:
                     f.write(f"{step} val {val_loss_avg.item():.4f}\n")
 
+                if (step > 0 and step % 5000 ==0) or (step == max_steps - 1):
+                    # optionally write model checkpoints
+                    checkpoint_path = os.path.join(LOG_DIR, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'step': step,
+                        'model': raw_model.state_dict(),
+                        'config': raw_model.config,
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': lr_scheduler.state_dict(),
+                        'val_loss': val_loss_avg.item()
+                    }
+                    torch.save(checkpoint, checkpoint_path)
+
         # once in a while evaludate HellaSwag.
         if step % EVAL_INTERVAL == 0 or step == max_steps - 1:
             num_correct = 0
