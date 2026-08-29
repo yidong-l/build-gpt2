@@ -1,10 +1,16 @@
 from dataclasses import dataclass
+import os
 import time
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental import mesh_utils
 from flax import nnx
 import optax
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import dataset_lite
 
 
 @dataclass
@@ -14,6 +20,7 @@ class GPTConfig:
     n_layer: int = 12  # number of transformer layers
     n_head: int = 12  # number of attention heads
     n_embd: int = 768  # embedding / hidden dimension
+    dtype: jnp.dtype = jnp.bfloat16  # standard compute and weight storage dtype for TPU
 
 
 class CausalSelfAttention(nnx.Module):
@@ -24,9 +31,21 @@ class CausalSelfAttention(nnx.Module):
         self.n_embd = config.n_embd
 
         # key, query, value projections
-        self.c_attn = nnx.Linear(config.n_embd, 3 * config.n_embd, rngs=rngs)
+        self.c_attn = nnx.Linear(
+            config.n_embd,
+            3 * config.n_embd,
+            dtype=config.dtype,
+            param_dtype=config.dtype,
+            rngs=rngs,
+        )
         # output projection
-        self.c_proj = nnx.Linear(config.n_embd, config.n_embd, rngs=rngs)
+        self.c_proj = nnx.Linear(
+            config.n_embd,
+            config.n_embd,
+            dtype=config.dtype,
+            param_dtype=config.dtype,
+            rngs=rngs,
+        )
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -50,8 +69,20 @@ class CausalSelfAttention(nnx.Module):
 
 class MLP(nnx.Module):
     def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
-        self.c_fc = nnx.Linear(config.n_embd, 4 * config.n_embd, rngs=rngs)
-        self.c_proj = nnx.Linear(4 * config.n_embd, config.n_embd, rngs=rngs)
+        self.c_fc = nnx.Linear(
+            config.n_embd,
+            4 * config.n_embd,
+            dtype=config.dtype,
+            param_dtype=config.dtype,
+            rngs=rngs,
+        )
+        self.c_proj = nnx.Linear(
+            4 * config.n_embd,
+            config.n_embd,
+            dtype=config.dtype,
+            param_dtype=config.dtype,
+            rngs=rngs,
+        )
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -63,9 +94,9 @@ class MLP(nnx.Module):
 
 class Block(nnx.Module):
     def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
-        self.ln_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        self.ln_1 = nnx.LayerNorm(config.n_embd, dtype=config.dtype, rngs=rngs)
         self.attn = CausalSelfAttention(config, rngs=rngs)
-        self.ln_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        self.ln_2 = nnx.LayerNorm(config.n_embd, dtype=config.dtype, rngs=rngs)
         self.mlp = MLP(config, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -78,10 +109,22 @@ class GPT(nnx.Module):
     def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
         self.config = config
 
-        self.wte = nnx.Embed(config.vocab_size, config.n_embd, rngs=rngs)
-        self.wpe = nnx.Embed(config.block_size, config.n_embd, rngs=rngs)
+        self.wte = nnx.Embed(
+            config.vocab_size,
+            config.n_embd,
+            dtype=config.dtype,
+            param_dtype=config.dtype,
+            rngs=rngs,
+        )
+        self.wpe = nnx.Embed(
+            config.block_size,
+            config.n_embd,
+            dtype=config.dtype,
+            param_dtype=config.dtype,
+            rngs=rngs,
+        )
         self.h = [Block(config, rngs=rngs) for _ in range(config.n_layer)]
-        self.ln_f = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        self.ln_f = nnx.LayerNorm(config.n_embd, dtype=config.dtype, rngs=rngs)
 
         # initialize weights
         self._init_weights(rngs)
@@ -94,13 +137,13 @@ class GPT(nnx.Module):
                 if hasattr(module, "NANOGPT_SCALE_INIT"):
                     std *= (2 * self.config.n_layer) ** -0.5
                 module.kernel[...] = (
-                    jax.random.normal(rngs.params(), module.kernel.shape) * std
+                    jax.random.normal(rngs.params(), module.kernel.shape, dtype=module.kernel.dtype) * std
                 )
                 if module.bias is not None:
                     module.bias[...] = jnp.zeros_like(module.bias[...])
             elif isinstance(module, nnx.Embed):
                 module.embedding[...] = (
-                    jax.random.normal(rngs.params(), module.embedding.shape) * 0.02
+                    jax.random.normal(rngs.params(), module.embedding.shape, dtype=module.embedding.dtype) * 0.02
                 )
             elif isinstance(module, nnx.LayerNorm):
                 pass
@@ -127,7 +170,8 @@ class GPT(nnx.Module):
 
         loss = None
         if targets is not None:
-            logits_flat = logits.reshape((-1, logits.shape[-1]))
+            # Compute cross-entropy in float32 for numerical stability
+            logits_flat = logits.reshape((-1, logits.shape[-1])).astype(jnp.float32)
             targets_flat = targets.reshape((-1,))
             loss = optax.softmax_cross_entropy_with_integer_labels(
                 logits=logits_flat, labels=targets_flat
@@ -242,6 +286,7 @@ def train_loop(
     model: GPT,
     optimizer: nnx.Optimizer,
     train_loader,
+    data_sharding: NamedSharding,
     grad_accum_steps: int,
     max_steps: int,
 ):
@@ -253,18 +298,23 @@ def train_loop(
     for step in range(max_steps):
         t0 = time.time()
 
-        # Gather micro-batches on host before single device transfer
+        # Gather micro-batches on host before device placement
         x_micro = []
         y_micro = []
         for _ in range(grad_accum_steps):
             bx, by = next(train_iter)
-            x_micro.append(bx)
-            y_micro.append(by)
+            x_micro.append(bx.numpy().astype(np.int32))
+            y_micro.append(by.numpy().astype(np.int32))
 
-        x_batches = jnp.array(np.stack(x_micro))
-        y_batches = jnp.array(np.stack(y_micro))
+        # Shape: (grad_accum_steps, B_global, T)
+        x_batches = np.stack(x_micro)
+        y_batches = np.stack(y_micro)
 
-        loss = train_step(model, optimizer, x_batches, y_batches)
+        # Place onto TPU mesh with sharding
+        x_sharded = jax.device_put(x_batches, data_sharding)
+        y_sharded = jax.device_put(y_batches, data_sharding)
+
+        loss = train_step(model, optimizer, x_sharded, y_sharded)
         loss_val = float(loss)
 
         t1 = time.time()
@@ -272,57 +322,44 @@ def train_loop(
         tokens_processed = x_batches.size
         tokens_per_sec = tokens_processed / dt if dt > 0 else 0.0
 
-        print(
-            f"Step {step}, Loss: {loss_val:.6f} | "
-            f"dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}"
-        )
-
-
-def verify_training(
-    model: GPT,
-    optimizer: nnx.Optimizer,
-    B: int,
-    T: int,
-):
-    """Sets up synthetic dataloader and executes a short verification run using train_loop."""
-    vocab_size = model.config.vocab_size
-    synthetic_batches = 20
-    grad_accum_steps = 2
-    max_steps = 5
-
-    # Synthetic training batches (B, T)
-    synthetic_train_data = [
-        (
-            jnp.ones((B, T), dtype=jnp.int32) * (i % vocab_size),
-            jnp.ones((B, T), dtype=jnp.int32) * ((i + 1) % vocab_size),
-        )
-        for i in range(synthetic_batches)
-    ]
-
-    train_loop(
-        model=model,
-        optimizer=optimizer,
-        train_loader=synthetic_train_data,
-        grad_accum_steps=grad_accum_steps,
-        max_steps=max_steps,
-    )
+        if jax.process_index() == 0:
+            print(
+                f"Step {step}, Loss: {loss_val:.6f} | "
+                f"dt: {dt*1000:.2f} ms, tok/sec: {tokens_per_sec:.2f}"
+            )
 
 
 if __name__ == "__main__":
+    # 1. Setup 1D Device Mesh & SPMD Sharding
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    mesh = Mesh(devices, axis_names=("data",))
+    data_sharding = NamedSharding(mesh, P(None, "data", None))
+    replicated_sharding = NamedSharding(mesh, P())
+
     total_batch_size = 524288  # 2**19, 0.5M tokens
     B, T = 32, 1024
-    assert total_batch_size % (B * T) == 0, "total_batch_size must be divisible by B * T"
-    grad_accum_steps = total_batch_size // (B * T)
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> gradient accumulation steps: {grad_accum_steps}")
+    num_devices = jax.device_count()
+    global_micro_batch_size = B * num_devices
+    assert (
+        total_batch_size % (global_micro_batch_size * T) == 0
+    ), "total_batch_size must be divisible by B * num_devices * T"
+    grad_accum_steps = total_batch_size // (global_micro_batch_size * T)
 
-    # Initialize a fresh model
+    if jax.process_index() == 0:
+        print(f"TPU devices detected: {num_devices} (local: {jax.local_device_count()}, hosts: {jax.process_count()})")
+        print(f"Per-device batch size: {B}, Context length: {T}")
+        print(f"Global batch size per micro-step: {global_micro_batch_size}")
+        print(f"Total desired batch size: {total_batch_size} tokens")
+        print(f"=> gradient accumulation steps: {grad_accum_steps}")
+
+    # 2. Initialize Model and Optimizer
     config = GPTConfig(vocab_size=50304)
     rngs = nnx.Rngs(0)
     model = GPT(config, rngs=rngs)
 
     num_params = count_parameters(model)
-    print(f"Instantiated GPT-2 model with {num_params:,} parameters.")
+    if jax.process_index() == 0:
+        print(f"Instantiated GPT-2 model with {num_params:,} parameters.")
 
     max_lr = 6e-4
     min_lr = 0.1 * max_lr
@@ -342,11 +379,52 @@ if __name__ == "__main__":
         clip_grad_norm=1.0,
     )
 
-    verify_training(
+    # 3. Setup PyTorch FineWeb Dataset & DataLoader
+    train_dataset = dataset_lite.FineWebDataset(
+        split="train", T=T
+    )
+    val_dataset = dataset_lite.FineWebDataset(
+        split="val", T=T
+    )
+
+    if jax.process_count() > 1:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=jax.process_count(),
+            rank=jax.process_index(),
+            shuffle=False,
+            drop_last=True,
+        )
+        loader_batch_size = B * jax.local_device_count()
+    else:
+        sampler = None
+        loader_batch_size = global_micro_batch_size
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=loader_batch_size,
+        shuffle=False,
+        sampler=sampler,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=loader_batch_size,
+        shuffle=False,
+        drop_last=True,
+    )
+
+    # 4. Execute Training Loop
+    # TODO: Remove the temporary max_steps overwrite before final full-dataset training run
+    max_steps = 25
+
+    train_loop(
         model=model,
         optimizer=optimizer,
-        B=B,
-        T=T,
+        train_loader=train_loader,
+        data_sharding=data_sharding,
+        grad_accum_steps=grad_accum_steps,
+        max_steps=max_steps,
     )
 
 

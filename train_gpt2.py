@@ -548,7 +548,6 @@ def learning_rate_scheduler(optimizer, max_lr, min_lr, warmup_steps, max_steps):
 #   torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 LOG_DIR = "log"
-DATA_DIR = '/home/ubuntu/local_data/edu_fineweb10B/'
 DDP_CFG = DDPConfig().from_env()
 
 if __name__ == "__main__":
@@ -579,8 +578,8 @@ if __name__ == "__main__":
         print(f"=> gradient accumulation steps: {grad_accum_steps}")
 
 
-    train_dataset = dataset_lite.FineWebDataset(split='train', T=T, data_dir=DATA_DIR)
-    val_dataset = dataset_lite.FineWebDataset(split='val', T=T, data_dir=DATA_DIR)
+    train_dataset = dataset_lite.FineWebDataset(split='train', T=T)
+    val_dataset = dataset_lite.FineWebDataset(split='val', T=T)
     sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=True) if DDP_CFG.enabled else None
     train_loader = DataLoader(train_dataset, batch_size=B, shuffle=False, sampler=sampler, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=B, shuffle=False, drop_last=True)

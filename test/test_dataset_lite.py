@@ -5,16 +5,14 @@ import numpy as np
 import torch
 
 class TestFineWebDataset(unittest.TestCase):
-    DATA_DIR = '/home/ubuntu/local_data/edu_fineweb10B/'
-
     def test_initialization(self):
-        dataset = FineWebDataset(data_dir=self.DATA_DIR, split='train', T=1024)
+        dataset = FineWebDataset(split='train', T=1024)
         self.assertGreater(len(dataset.shards), 0)
         self.assertGreater(dataset.num_tokens, 0)
         self.assertGreater(len(dataset), 0)
 
     def test_getitem(self):
-        dataset = FineWebDataset(data_dir=self.DATA_DIR, split='train', T=1024)
+        dataset = FineWebDataset(split='train', T=1024)
         x, y = dataset[0]
         self.assertEqual(x.shape[0], 1024)
         self.assertEqual(y.shape[0], 1024)
@@ -24,8 +22,7 @@ class TestFineWebDataset(unittest.TestCase):
         B = 64
         T = 1024
         NUM_SHARDS = 3
-        standard_dataset = FineWebDataset(
-            data_dir=self.DATA_DIR, split='train', T=T)
+        standard_dataset = FineWebDataset(split='train', T=T)
         standard_loader = DataLoader(
             standard_dataset, batch_size=B, shuffle=False, drop_last=True)
         merged = np.concatenate(standard_dataset.mmaps[:NUM_SHARDS])
@@ -46,12 +43,11 @@ class TestFineWebDataset(unittest.TestCase):
     def test_dataloader_equivalency(self):
         B = 64
         lite_loader = DataLoaderLite(
-            data_dir=self.DATA_DIR, split='train',
             B=B, T=1024,
-            process_rank=0, num_processes=1)
+            process_rank=0, num_processes=1,
+            split='train')
 
-        standard_dataset = FineWebDataset(
-            data_dir=self.DATA_DIR, split='train', T=1024)
+        standard_dataset = FineWebDataset(split='train', T=1024)
         standard_loader = DataLoader(
             standard_dataset, batch_size=B, shuffle=False, drop_last=True)
 

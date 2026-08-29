@@ -22,8 +22,9 @@ remote_name = "sample-10BT"
 shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 
 # create the cache the local directory if it doesn't exist yet
+DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "local_data", "edu_fineweb10B")
 parser = argparse.ArgumentParser()
-parser.add_argument('--output', type=str, default='./edu_fineweb10B', help='Directory to save the tokenized data shards.')
+parser.add_argument('--output', type=str, default=DEFAULT_OUTPUT_DIR, help='Directory to save the tokenized data shards.')
 args = parser.parse_args()
 DATA_CACHE_DIR = args.output
 

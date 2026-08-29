@@ -5,8 +5,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+DATA_DIR = os.path.join(os.path.dirname(__file__), "local_data", "edu_fineweb10B")
+
+
 class FineWebDataset(Dataset):
-    def __init__(self, data_dir, file_prefix= "edufineweb", split="train", T=1024):
+    def __init__(self, data_dir=DATA_DIR, file_prefix="edufineweb", split="train", T=1024):
         """
         Args:
             data_dir: Path to the directory containing .npy files (e.g., 'edu_fineweb10B')
@@ -98,7 +101,7 @@ def load_tokens(filename):
     return ptt
 
 class DataLoaderLite:
-    def __init__(self, data_dir, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, data_dir=DATA_DIR):
         self.B = B
         self.T = T
         self.process_rank = process_rank
