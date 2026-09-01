@@ -10,6 +10,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import mesh_utils, multihost_utils
 from flax import nnx
 import optax
+import orbax.checkpoint as ocp
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import dataset_lite
@@ -376,16 +377,29 @@ def train_loop(
     """Training loop executing training steps, periodic validation loss,
     HellaSwag evaluation, text generation, and telemetry logging.
     """
-    EVAL_INTERVAL = 50
+    EVAL_INTERVAL = 250
     LOG_DIR = "log"
+    CKPT_DIR = "checkpoints"
     os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(CKPT_DIR, exist_ok=True)
     log_file = os.path.join(LOG_DIR, "log.txt")
+
+    checkpoint_options = ocp.CheckpointManagerOptions(
+        max_to_keep=3,
+        create=True,
+        step_prefix="step",
+    )
+    checkpoint_manager = ocp.CheckpointManager(
+        os.path.abspath(CKPT_DIR),
+        options=checkpoint_options,
+    )
 
     if jax.process_index() == 0:
         with open(log_file, "w") as f:  # mode 'w' to clear the file
             pass
 
     train_iter = numpy_loader(train_loader, infinite=True)
+    val_loss_avg = 0.0
 
     for step in range(max_steps):
         t0 = time.time()
@@ -407,7 +421,20 @@ def train_loop(
                 with open(log_file, "a") as f:
                     f.write(f"{step} val {val_loss_avg:.4f}\n")
 
-        # 2) Once in a while evaluate HellaSwag
+        # 2) Save checkpoint periodically
+        if (step > 0 and step % 5000 == 0) or (step == max_steps - 1):
+            checkpoint_data = {
+                "model": nnx.state(model),
+                "optimizer": nnx.state(optimizer),
+                "step": step,
+                "val_loss": val_loss_avg,
+            }
+            checkpoint_manager.save(
+                step,
+                args=ocp.args.StandardSave(checkpoint_data),
+            )
+
+        # 3) Once in a while evaluate HellaSwag
         if step % EVAL_INTERVAL == 0 or step == max_steps - 1:
             num_correct = 0
             num_total = 0
@@ -449,7 +476,7 @@ def train_loop(
                 with open(log_file, "a") as f:
                     f.write(f"{step} hella {acc_norm:.4f}\n")
 
-        # 3) Once in a while generate text from the model
+        # 4) Once in a while generate text from the model
         if (step % EVAL_INTERVAL == 0 and step > 0) or step == max_steps - 1:
             sample_rng = jax.random.key(42 + jax.process_index())
             samples = sample(
@@ -495,6 +522,8 @@ def train_loop(
             )
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_val:.6f}\n")
+
+    checkpoint_manager.wait_until_finished()
 
 
 if __name__ == "__main__":
@@ -584,9 +613,6 @@ if __name__ == "__main__":
     )
 
     # 4. Execute Training Loop
-    # TODO: Remove the temporary max_steps overwrite before final full-dataset training run
-    max_steps = 510
-
     train_loop(
         model=model,
         optimizer=optimizer,
